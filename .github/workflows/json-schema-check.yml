@@ -1,0 +1,100 @@
+name: MSOBB owned VS Code JSON schema UNC boundary
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  schema:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Probe shipped Code Restricted Mode JSON schema path
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $hostAlias = 'msobb-loopback.test'
+          Add-Content "$env:windir\System32\drivers\etc\hosts" "`n127.0.0.1 $hostAlias`n"
+          $shareDir = 'C:\MSOBB-schema-share'
+          New-Item -ItemType Directory -Force $shareDir | Out-Null
+          Set-Content -Path (Join-Path $shareDir 'schema.json') -Value '{"type":"object","properties":{"flag":{"type":"integer"}}}'
+          $testUser = 'MSOBBProbe'
+          $testPassword = [guid]::NewGuid().ToString('N') + 'aA1!'
+          $secure = ConvertTo-SecureString $testPassword -AsPlainText -Force
+          New-LocalUser -Name $testUser -Password $secure -PasswordNeverExpires | Out-Null
+          $account = "$env:COMPUTERNAME\$testUser"
+          icacls $shareDir /grant "${account}:(OI)(CI)RX" | Out-Null
+          New-SmbShare -Name 'MSOBB' -Path $shareDir -ReadAccess $account, 'Everyone' | Out-Null
+          cmdkey /add:$hostAlias /user:$account /pass:$testPassword | Out-Null
+          cmdkey /add:$env:COMPUTERNAME /user:$account /pass:$testPassword | Out-Null
+          try {
+            $nativeMachine = Test-Path -LiteralPath "\\$env:COMPUTERNAME\MSOBB\schema.json"
+            $nativeAlias = Test-Path -LiteralPath "\\$hostAlias\MSOBB\schema.json"
+            $smbPort = Test-NetConnection -ComputerName '127.0.0.1' -Port 445 -InformationLevel Quiet -WarningAction SilentlyContinue
+            Write-Host "MSOBB_NATIVE_MACHINE=$nativeMachine MSOBB_NATIVE_ALIAS=$nativeAlias MSOBB_SMB_PORT=$smbPort"
+            $zip = Join-Path $env:RUNNER_TEMP 'code.zip'
+            Invoke-WebRequest 'https://update.code.visualstudio.com/1.144.0/win32-x64-archive/stable' -OutFile $zip
+            $codeRoot = Join-Path $env:RUNNER_TEMP 'Code'
+            Expand-Archive $zip -DestinationPath $codeRoot -Force
+            $codeExe = Get-ChildItem -Path $codeRoot -Filter 'Code.exe' -Recurse -File | Select-Object -First 1 -ExpandProperty FullName
+            if (!$codeExe) { throw 'Code archive missing' }
+            $fixture = Join-Path $env:RUNNER_TEMP 'MSOBB-json-workspace'
+            $outside = Join-Path $env:RUNNER_TEMP 'MSOBB-outside-schema.json'
+            New-Item -ItemType Directory -Force $fixture | Out-Null
+            Set-Content $outside -Value '{"type":"object","properties":{"flag":{"type":"integer"}}}'
+            $outsideUri = [Uri]::new($outside).AbsoluteUri
+            $cases = [ordered]@{
+              local = $outsideUri
+              missing = ([Uri]::new((Join-Path $env:RUNNER_TEMP 'MSOBB-missing-schema.json'))).AbsoluteUri
+              machine = "file://$env:COMPUTERNAME/MSOBB/schema.json"
+              alias = "file://$hostAlias/MSOBB/schema.json"
+            }
+            foreach ($name in $cases.Keys) {
+              $json = @{ '$schema' = $cases[$name]; flag = 'MSOBB_STRING_MARKER' } | ConvertTo-Json
+              Set-Content (Join-Path $fixture "$name.json") -Value $json
+            }
+            $extension = Join-Path $env:RUNNER_TEMP 'MSOBB-diagnostic-observer'
+            New-Item -ItemType Directory -Force $extension | Out-Null
+            @'
+          {"name":"msobb-diagnostic-observer","displayName":"MSOBB diagnostic observer","version":"0.0.1","publisher":"msobb","engines":{"vscode":"^1.100.0"},"main":"./extension.js","activationEvents":["onStartupFinished"],"capabilities":{"untrustedWorkspaces":{"supported":true}}}
+          '@ | Set-Content (Join-Path $extension 'package.json') -Encoding utf8
+            @'
+          const vscode=require('vscode'),fs=require('fs'),path=require('path');
+          exports.activate=async function(){
+            const root=process.env.MSOBB_WORKSPACE, out=process.env.MSOBB_RESULT_PATH;
+            const result={trusted:vscode.workspace.isTrusted,cases:{}};
+            for(const name of ['local','missing','machine','alias']){
+              const uri=vscode.Uri.file(path.join(root,name+'.json'));
+              try{
+                const doc=await vscode.workspace.openTextDocument(uri);
+                await vscode.window.showTextDocument(doc);
+                await new Promise(r=>setTimeout(r,3500));
+                const messages=vscode.languages.getDiagnostics(uri).map(d=>d.message);
+                result.cases[name]={opened:true,typeMismatch:messages.some(x=>x.includes('Incorrect type. Expected')),schemaMissing:messages.some(x=>x.includes('Unable to load schema')),diagnosticCount:messages.length};
+              }catch(e){result.cases[name]={opened:false,errorCode:e.code||e.name||'error'};}
+            }
+            fs.writeFileSync(out,JSON.stringify(result));
+          };
+          '@ | Set-Content (Join-Path $extension 'extension.js') -Encoding utf8
+            $resultPath = Join-Path $env:RUNNER_TEMP 'MSOBB-result.json'
+            $env:MSOBB_WORKSPACE = $fixture
+            $env:MSOBB_RESULT_PATH = $resultPath
+            $userData = Join-Path $env:RUNNER_TEMP 'MSOBB-code-user'
+            $extensionsDir = Join-Path $env:RUNNER_TEMP 'MSOBB-code-ext'
+            $arguments = @("--user-data-dir=$userData", "--extensions-dir=$extensionsDir", '--disable-updates', "--extensionDevelopmentPath=$extension", $fixture)
+            $proc = Start-Process -FilePath $codeExe -ArgumentList $arguments -PassThru
+            for ($i=0; $i -lt 90 -and !(Test-Path $resultPath); $i++) { Start-Sleep -Seconds 1 }
+            $codeResult = if (Test-Path $resultPath) { Get-Content $resultPath -Raw | ConvertFrom-Json } else { $null }
+            $ownedSessions = @(Get-SmbSession -ErrorAction SilentlyContinue | Where-Object { $_.ClientUserName -like '*MSOBBProbe*' }).Count
+            if ($codeResult) { Write-Host "MSOBB_RESULT=$($codeResult | ConvertTo-Json -Compress -Depth 10)" }
+            else { Write-Host "MSOBB_RESULT_MISSING=True CODE_EXITED=$($proc.HasExited)" }
+            Write-Host "MSOBB_OWNED_SMB_SESSION_COUNT=$ownedSessions"
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+          }
+          finally {
+            cmdkey /delete:$hostAlias | Out-Null
+            cmdkey /delete:$env:COMPUTERNAME | Out-Null
+            Remove-SmbShare -Name 'MSOBB' -Force -ErrorAction SilentlyContinue
+            Remove-LocalUser -Name $testUser -ErrorAction SilentlyContinue
+            Remove-Variable testPassword -ErrorAction SilentlyContinue
+          }
