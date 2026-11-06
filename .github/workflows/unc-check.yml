@@ -1,0 +1,71 @@
+name: MSOBB owned Windows TS6 UNC boundary
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  unc:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Probe local and UNC config under shipped Code runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $hostAlias = 'msobb-loopback.test'
+          Add-Content "$env:windir\System32\drivers\etc\hosts" "`n127.0.0.1 $hostAlias`n"
+          $shareDir = Join-Path $env:RUNNER_TEMP 'MSOBB-share'
+          New-Item -ItemType Directory -Force $shareDir | Out-Null
+          Set-Content -Path (Join-Path $shareDir 'base.json') -Value '{"compilerOptions":{"strict":true}}'
+          $testUser = 'MSOBBProbe'
+          $testPassword = [guid]::NewGuid().ToString('N') + 'aA1!'
+          $secure = ConvertTo-SecureString $testPassword -AsPlainText -Force
+          New-LocalUser -Name $testUser -Password $secure -PasswordNeverExpires | Out-Null
+          $account = "$env:COMPUTERNAME\$testUser"
+          icacls $shareDir /grant "${account}:(OI)(CI)RX" | Out-Null
+          New-SmbShare -Name 'MSOBB' -Path $shareDir -ReadAccess $account | Out-Null
+          cmdkey /add:$hostAlias /user:$account /pass:$testPassword | Out-Null
+          try {
+            $unc = "\\$hostAlias\MSOBB\base.json"
+            $nativePositive = Test-Path -LiteralPath $unc
+            Write-Host "MSOBB_NATIVE_UNC_CONTROL=$nativePositive"
+            $zip = Join-Path $env:RUNNER_TEMP 'code.zip'
+            Invoke-WebRequest 'https://update.code.visualstudio.com/1.144.0/win32-x64-archive/stable' -OutFile $zip
+            $codeRoot = Join-Path $env:RUNNER_TEMP 'Code'
+            Expand-Archive $zip -DestinationPath $codeRoot -Force
+            $codeExe = Join-Path $codeRoot 'Code.exe'
+            $tsJs = Join-Path $codeRoot 'resources\app\extensions\node_modules\typescript\lib\typescript.js'
+            if (!(Test-Path $codeExe) -or !(Test-Path $tsJs)) { throw 'Code or bundled TypeScript missing' }
+            $script = Join-Path $env:RUNNER_TEMP 'probe.cjs'
+            @'
+          const fs=require('fs'), path=require('path'), ts=require(process.argv[2]);
+          const root=path.join(process.env.RUNNER_TEMP,'MSOBB-ts-project');
+          fs.mkdirSync(root,{recursive:true});
+          fs.writeFileSync(path.join(root,'index.ts'),'export const x: number = 1;');
+          fs.writeFileSync(path.join(root,'base.json'),' {"compilerOptions":{"strict":true}} ');
+          const alias='msobb-loopback.test';
+          const entries=[['local','./base.json'],['unc','//'+alias+'/MSOBB/base.json']];
+          const output={tsVersion:ts.version,nodeVersion:process.version,results:{}};
+          for(const [name,target] of entries){
+            const cfg=path.join(root,'tsconfig-'+name+'.json');
+            fs.writeFileSync(cfg,JSON.stringify({extends:target,files:['index.ts']}));
+            const seen=[];const host={...ts.sys,fileExists(p){if(p.includes(alias)||p.includes('base.json'))seen.push({kind:'fileExists',isUNC:p.includes(alias)});return ts.sys.fileExists(p)},readFile(p){if(p.includes(alias)||p.includes('base.json'))seen.push({kind:'readFile',isUNC:p.includes(alias)});return ts.sys.readFile(p)}};
+            const read=ts.readConfigFile(cfg,host.readFile);
+            const parsed=ts.parseJsonConfigFileContent(read.config,host,root,undefined,cfg);
+            output.results[name]={strict:parsed.options.strict??null,diagnosticCodes:parsed.errors.map(e=>e.code),seen};
+          }
+          const unc='\\\\'+alias+'\\MSOBB\\base.json';
+          try{output.rawStat={exists:fs.statSync(unc).isFile()}}catch(e){output.rawStat={errorCode:e.code||e.name}}
+          console.log('MSOBB_RESULT='+JSON.stringify(output));
+          '@ | Set-Content -Path $script -Encoding utf8
+            $env:ELECTRON_RUN_AS_NODE = '1'
+            & $codeExe $script $tsJs
+            if ($LASTEXITCODE -ne 0) { throw "Code runtime failed: $LASTEXITCODE" }
+          }
+          finally {
+            cmdkey /delete:$hostAlias | Out-Null
+            Remove-SmbShare -Name 'MSOBB' -Force -ErrorAction SilentlyContinue
+            Remove-LocalUser -Name $testUser -ErrorAction SilentlyContinue
+            Remove-Variable testPassword -ErrorAction SilentlyContinue
+          }
