@@ -15,7 +15,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $hostAlias = 'msobb-loopback.test'
           Add-Content "$env:windir\System32\drivers\etc\hosts" "`n127.0.0.1 $hostAlias`n"
-          $shareDir = Join-Path $env:RUNNER_TEMP 'MSOBB-share'
+          $shareDir = 'C:\MSOBB-share'
           New-Item -ItemType Directory -Force $shareDir | Out-Null
           Set-Content -Path (Join-Path $shareDir 'base.json') -Value '{"compilerOptions":{"strict":true}}'
           $testUser = 'MSOBBProbe'
@@ -24,19 +24,23 @@ jobs:
           New-LocalUser -Name $testUser -Password $secure -PasswordNeverExpires | Out-Null
           $account = "$env:COMPUTERNAME\$testUser"
           icacls $shareDir /grant "${account}:(OI)(CI)RX" | Out-Null
-          New-SmbShare -Name 'MSOBB' -Path $shareDir -ReadAccess $account | Out-Null
+          New-SmbShare -Name 'MSOBB' -Path $shareDir -ReadAccess $account, 'Everyone' | Out-Null
           cmdkey /add:$hostAlias /user:$account /pass:$testPassword | Out-Null
           try {
             $unc = "\\$hostAlias\MSOBB\base.json"
-            $nativePositive = Test-Path -LiteralPath $unc
-            Write-Host "MSOBB_NATIVE_UNC_CONTROL=$nativePositive"
+            $nativeAlias = Test-Path -LiteralPath $unc
+            $machineUnc = "\\$env:COMPUTERNAME\MSOBB\base.json"
+            $nativeMachine = Test-Path -LiteralPath $machineUnc
+            $smbPort = (Test-NetConnection -ComputerName '127.0.0.1' -Port 445 -InformationLevel Quiet -WarningAction SilentlyContinue)
+            Write-Host "MSOBB_SMB_PORT=$smbPort MSOBB_NATIVE_ALIAS=$nativeAlias MSOBB_NATIVE_MACHINE=$nativeMachine"
             $zip = Join-Path $env:RUNNER_TEMP 'code.zip'
             Invoke-WebRequest 'https://update.code.visualstudio.com/1.144.0/win32-x64-archive/stable' -OutFile $zip
             $codeRoot = Join-Path $env:RUNNER_TEMP 'Code'
             Expand-Archive $zip -DestinationPath $codeRoot -Force
-            $codeExe = Join-Path $codeRoot 'Code.exe'
-            $tsJs = Join-Path $codeRoot 'resources\app\extensions\node_modules\typescript\lib\typescript.js'
-            if (!(Test-Path $codeExe) -or !(Test-Path $tsJs)) { throw 'Code or bundled TypeScript missing' }
+            $codeExe = Get-ChildItem -Path $codeRoot -Filter 'Code.exe' -Recurse -File | Select-Object -First 1 -ExpandProperty FullName
+            $tsJs = Get-ChildItem -Path $codeRoot -Filter 'typescript.js' -Recurse -File | Where-Object { $_.FullName -match 'typescript\\lib\\typescript\.js$' } | Select-Object -First 1 -ExpandProperty FullName
+            Write-Host "MSOBB_CODE_FOUND=$([bool]$codeExe) MSOBB_TS_FOUND=$([bool]$tsJs)"
+            if (!$codeExe -or !$tsJs) { throw 'Code or bundled TypeScript missing' }
             $script = Join-Path $env:RUNNER_TEMP 'probe.cjs'
             @'
           const fs=require('fs'), path=require('path'), ts=require(process.argv[2]);
