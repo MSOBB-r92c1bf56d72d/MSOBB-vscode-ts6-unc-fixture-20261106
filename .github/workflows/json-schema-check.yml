@@ -71,6 +71,11 @@ jobs:
                 await new Promise(r=>setTimeout(r,3500));
                 const messages=vscode.languages.getDiagnostics(uri).map(d=>d.message);
                 result.cases[name]={opened:true,typeMismatch:messages.some(x=>x.includes('Incorrect type. Expected')),schemaMissing:messages.some(x=>x.includes('Unable to load schema')),diagnosticCount:messages.length};
+                if(name==='machine'||name==='alias'){
+                  const schema=JSON.parse(doc.getText()).$schema;
+                  try{await vscode.workspace.fs.stat(vscode.Uri.parse(schema));result.cases[name].fsStat='success';}
+                  catch(e){result.cases[name].fsStat=e.code||e.name||'error';result.cases[name].uncGuard=String(e.message||'').includes('UNC_HOST_NOT_ALLOWED')||String(e.message||'').includes('UNC host');}
+                }
               }catch(e){result.cases[name]={opened:false,errorCode:e.code||e.name||'error'};}
             }
             fs.writeFileSync(out,JSON.stringify(result));
